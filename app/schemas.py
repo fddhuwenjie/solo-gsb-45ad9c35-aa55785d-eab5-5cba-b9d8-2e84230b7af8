@@ -1,0 +1,159 @@
+"""请求 / 响应的 Pydantic 模型。"""
+
+from __future__ import annotations
+
+from typing_extensions import Self
+
+from pydantic import BaseModel, Field, model_validator
+
+# 段级状态：
+#   missing   —— 尚无任何译文
+#   submitted —— 存在依据当前原文版本、待确认的译文
+#   confirmed —— 存在依据当前原文版本的已确认译文
+#   stale     —— 最新译文依据的是旧原文版本（已确认译文失效，待复核）
+SEGMENT_MISSING = "missing"
+SEGMENT_SUBMITTED = "submitted"
+SEGMENT_CONFIRMED = "confirmed"
+SEGMENT_STALE = "stale"
+
+
+class CreateManuscript(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    segments: list[str] = Field(min_length=1)
+
+
+class RewriteSource(BaseModel):
+    text: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+
+
+class SubmitTranslation(BaseModel):
+    text: str = Field(min_length=1)
+    source_version: int = Field(ge=1)
+
+
+class ConfirmTranslation(BaseModel):
+    source_version: int = Field(ge=1)
+
+
+class PublishRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+class SwitchEffectiveRequest(BaseModel):
+    """把当前生效定版切回任一已发布旧版。
+
+    target_edition   —— 目标版号（必须是该稿件已发布的定版）；
+    expected_edition —— 请求方看到的当前生效版号（乐观并发控制：
+                        其间若有新发布或别的切换改变了生效版，则过期拒绝）。
+    """
+
+    target_edition: int = Field(ge=1)
+    expected_edition: int = Field(ge=1)
+
+
+class RegisterErratumRequest(BaseModel):
+    """为"当前生效定版"的指定段落登记勘误附注。
+
+    position         —— 该版快照中的段位置（从 0 起）；
+    corrected_text   —— 更正译文（不覆盖快照，仅作为附注呈现给读者）；
+    note             —— 更正说明；
+    expected_edition —— 请求方看到的当前生效版号：与之不符即整次拒绝，
+                        保证快照与附注必属同一版。
+    同一版的同一段至多一条附注。
+    """
+
+    position: int = Field(ge=0)
+    corrected_text: str = Field(min_length=1)
+    note: str = Field(min_length=1)
+    expected_edition: int = Field(ge=1)
+
+
+class ReorderItem(BaseModel):
+    """编排清单项：二选一。
+
+    * source_position —— 引用"调整前"的旧段位置（旧段不能被重复引用）；
+    * source_text     —— 在该位置插入一段全新原文（新版本从 1 起，无译文）。
+    """
+
+    source_position: int | None = Field(default=None, ge=0)
+    source_text: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _exactly_one_reference(self) -> Self:
+        if (self.source_position is None) == (self.source_text is None):
+            raise ValueError("每一项必须且只能提供 source_position 或 source_text 之一")
+        return self
+
+
+class ReorderSegments(BaseModel):
+    expected_revision: int = Field(ge=1)
+    # 清单至少保留一段；进一步要求至少引用一段旧段（不能整篇全删再全新建）
+    segments: list[ReorderItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _at_least_one_retained(self) -> Self:
+        if all(item.source_position is None for item in self.segments):
+            raise ValueError("编排清单必须至少保留一段调整前的旧段")
+        return self
+
+
+
+class TranslationView(BaseModel):
+    source_version: int
+    target_text: str
+    status: str
+    updated_at: str
+
+
+class SegmentView(BaseModel):
+    position: int
+    source_text: str
+    source_version: int
+    status: str
+    translation: TranslationView | None = None
+    # 失效待复核的旧译文（若有），随工作稿一并展示供复核参考
+    stale_translation: TranslationView | None = None
+
+
+class DraftView(BaseModel):
+    manuscript_id: int
+    title: str
+    revision: int
+    segments: list[SegmentView]
+
+
+class PublicationSegment(BaseModel):
+    position: int
+    source_version: int
+    source_text: str
+    target_text: str
+
+
+class PublicationView(BaseModel):
+    edition: int
+    revision: int
+    title: str
+    published_at: str
+    segments: list[PublicationSegment]
+
+
+class ErratumView(BaseModel):
+    """单条勘误附注：只属于某个已发布版号（不在快照内，不改写快照）。"""
+
+    position: int
+    source_version: int
+    original_target_text: str   # 该版快照中该段原有的译文
+    corrected_target_text: str  # 更正译文
+    note: str
+    created_at: str
+
+
+class EffectivePublicationView(PublicationView):
+    """读者视角的"当前生效定版"：快照内容 + 当前生效版号 + 该版附注。
+
+    errata 只包含属于当前生效版的附注；快照与附注必属同一版。
+    """
+
+    effective_edition: int
+    errata: list[ErratumView] = []
